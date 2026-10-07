@@ -1,0 +1,389 @@
+* json2dir evaluator in SNOBOL4 (CSNOBOL4).
+* Reads the JSON document byte-exact from standard input, checks UTF-8, parses
+* it with one recursive SNOBOL4 pattern, validates all of it (RFC J2D-1
+* sections 3, 4) and writes a POSIX shell script that creates the tree to
+* standard output, ending with the line '# json2dir: end'. On any error: a
+* message on standard error, exit status 1 and no end marker.
+*
+        &ANCHOR = 1
+        &FULLSCAN = 1
+        &TRIM = 0
+        &STLIMIT = -1
+* NVAL: string value / member table / element table; NCNT: element count;
+* NQ: the string as shell words (single-quoted, split at NUL).
+        DATA('NODE(NKIND,NVAL,NCNT,NQ)')
+        DATA('CELL(HEAD,NEXT)')
+        NUL = CHAR(0)
+        NL = CHAR(10)
+        Q1 = "'"
+        BS = '\'
+        ERRMSG =
+*
+* RANGE(LO,HI): the string of all bytes LO..HI.
+        DEFINE('RANGE(LO,HI)')                          :(RANGE_END)
+RANGE   RANGE = RANGE CHAR(LO)
+        LO = LT(LO,HI) LO + 1                           :S(RANGE)F(RETURN)
+RANGE_END
+*
+* SETERR(M): remember the first error message, then fail.
+        DEFINE('SETERR(M)')                             :(SETERR_END)
+SETERR  ERRMSG = IDENT(ERRMSG) M                        :(FRETURN)
+SETERR_END
+*
+* Long strings grow piece by piece into a buffer (a NODE holding a list of
+* pieces, newest first, and their count) and are joined pairwise at the end:
+* O(n log n) instead of O(n^2) for repeated concatenation. (Lists, because
+* CSNOBOL4 tables search linearly.)
+        DEFINE('BNEW()')                                :(BNEW_END)
+BNEW    BNEW = NODE('B', , 0)                           :(RETURN)
+BNEW_END
+        DEFINE('BADD(B,X)')                             :(BADD_END)
+BADD    NCNT(B) = NCNT(B) + 1
+        NVAL(B) = CELL(X, NVAL(B))                      :(RETURN)
+BADD_END
+        DEFINE('BJOIN(B)T,N,I,J,L')                     :(BJOIN_END)
+BJOIN   N = NCNT(B)
+        EQ(N, 0)                                        :S(RETURN)
+        T = ARRAY(N)
+        L = NVAL(B)
+        I = N
+BJOINA  T<I> = HEAD(L)
+        L = NEXT(L)
+        I = GT(I, 1) I - 1                              :S(BJOINA)
+BJOIN1  EQ(N, 1)                                        :S(BJOIND)
+        I = 0
+        J = 0
+BJOIN2  I = LE(I + 2, N) I + 2                          :F(BJOIN3)
+        J = J + 1
+        T<J> = T<I - 1> T<I>                            :(BJOIN2)
+BJOIN3  EQ(REMDR(N, 2), 1)                              :F(BJOIN4)
+        J = J + 1
+        T<J> = T<N>
+BJOIN4  N = J                                           :(BJOIN1)
+BJOIND  BJOIN = T<1>                                    :(RETURN)
+BJOIN_END
+*
+* ---------------------------------------------------------------- input
+* Strict UTF-8: no overlongs, no surrogates, nothing above U+10FFFF.
+        C8 = ANY(RANGE(128,191))
+        U8 = SPAN(RANGE(0,127))
++          | ANY(RANGE(194,223)) C8
++          | CHAR(224) ANY(RANGE(160,191)) C8
++          | ANY(RANGE(225,236)) C8 C8
++          | CHAR(237) ANY(RANGE(128,159)) C8
++          | ANY(RANGE(238,239)) C8 C8
++          | CHAR(240) ANY(RANGE(144,191)) C8 C8
++          | ANY(RANGE(241,243)) C8 C8 C8
++          | CHAR(244) ANY(RANGE(128,143)) C8 C8
+*
+* The input is read in binary records and each record is checked as it
+* arrives (matching against short subjects is cheap); a sequence cut at the
+* end of a record is carried over to the next one.
+        INPUT(.IN, 20, 'B,4096', '/dev/stdin')          :F(NOIN)
+        OUTPUT(.OUT, 21, 'B', '/dev/stdout')            :F(NOOUT)
+        DB = BNEW()
+        CARRY =
+READ    REC = IN                                        :F(READE)
+        BADD(DB, REC)
+        REC = CARRY REC
+        P = 0
+READU   REC TAB(P) U8 @P                                :S(READU)
+        REC TAB(P) REM . CARRY
+        LT(SIZE(CARRY), 4)                              :S(READ)
+BADU8   SETERR('input is not valid UTF-8')              :(FAIL)
+READE   IDENT(CARRY)                                    :F(BADU8)
+        DOC = BJOIN(DB)
+*
+* A byte order mark at the start is ignored, as RFC 8259 permits.
+        DOC CHAR(239) CHAR(187) CHAR(191) =
+*
+* ---------------------------------------------------------------- strings
+        ESC = TABLE()
+        ESC<'"'> = '"'
+        ESC<BS> = BS
+        ESC<'/'> = '/'
+        ESC<'b'> = CHAR(8)
+        ESC<'f'> = CHAR(12)
+        ESC<'n'> = CHAR(10)
+        ESC<'r'> = CHAR(13)
+        ESC<'t'> = CHAR(9)
+        HEXC = '0123456789abcdef'
+        HX = TABLE()
+        I = 0
+HXLOOP  HEXC LEN(I) LEN(1) . H                          :F(HXDONE)
+        HX<H> = I
+        HX<REPLACE(H,'abcdef','ABCDEF')> = I
+        I = I + 1                                       :(HXLOOP)
+HXDONE
+*
+* HEXV(H): value of four hex digits.
+        DEFINE('HEXV(H)C')                              :(HEXV_END)
+HEXV    H LEN(1) . C =                                  :F(RETURN)
+        HEXV = HEXV * 16 + HX<C>                        :(HEXV)
+HEXV_END
+*
+* UTF8(CP): the UTF-8 bytes of code point CP.
+        DEFINE('UTF8(CP)')                              :(UTF8_END)
+UTF8    UTF8 = LT(CP,128) CHAR(CP)                      :S(RETURN)
+        UTF8 = LT(CP,2048) CHAR(192 + CP / 64)
++              CHAR(128 + REMDR(CP,64))                 :S(RETURN)
+        UTF8 = LT(CP,65536) CHAR(224 + CP / 4096)
++              CHAR(128 + REMDR(CP / 64,64))
++              CHAR(128 + REMDR(CP,64))                 :S(RETURN)
+        UTF8 = CHAR(240 + CP / 262144)
++              CHAR(128 + REMDR(CP / 4096,64))
++              CHAR(128 + REMDR(CP / 64,64))
++              CHAR(128 + REMDR(CP,64))                 :(RETURN)
+UTF8_END
+*
+* String decoding happens inside the pattern match: each piece of a JSON
+* string calls one of these, which append to two buffers: SRAW, the decoded
+* bytes, and SQ, the same bytes as single-quoted shell words (' becomes
+* '\'' and a NUL ends one word and starts the next). PENDHI holds a high
+* surrogate escape waiting for its low half.
+        DEFINE('SBEGIN()')                              :(SBEGIN_END)
+SBEGIN  SRAW = BNEW()
+        SQ = BNEW()
+        BADD(SQ, Q1)
+        PENDHI = 0
+        SNUL = 0                                        :(RETURN)
+SBEGIN_END
+*
+        DEFINE('SADD(R,Q)')                             :(SADD_END)
+SADD    NE(PENDHI, 0)                                   :S(SADDL)
+        BADD(SRAW, R)
+        BADD(SQ, Q)                                     :(RETURN)
+SADDL   SETERR('unpaired surrogate escape')             :(FRETURN)
+SADD_END
+*
+        DEFINE('SPLAIN()')                              :(SPLAIN_END)
+SPLAIN  SADD(X, X)                                      :S(RETURN)F(FRETURN)
+SPLAIN_END
+*
+        DEFINE('SQUOTE()')                              :(SQUOTE_END)
+SQUOTE  SADD(Q1, Q1 BS Q1 Q1)                           :S(RETURN)F(FRETURN)
+SQUOTE_END
+*
+        DEFINE('SESC()')                                :(SESC_END)
+SESC    SADD(ESC<E>, ESC<E>)                            :S(RETURN)F(FRETURN)
+SESC_END
+*
+        DEFINE('SUNI()U')                               :(SUNI_END)
+SUNI    U = HEXV(H)
+        NE(PENDHI, 0)                                   :S(SUNILO)
+        GE(U,56320) LE(U,57343)                         :S(SUNIL)
+        GE(U,55296) LE(U,56319)                         :S(SUNIHI)
+        EQ(U, 0)                                        :S(SUNINUL)
+        SADD(UTF8(U), UTF8(U))                          :(RETURN)
+SUNIHI  PENDHI = U                                      :(RETURN)
+SUNINUL SNUL = 1
+        SADD(NUL, Q1 ' ' Q1)                            :(RETURN)
+SUNILO  GE(U,56320) LE(U,57343)                         :F(SUNIL)
+        U = 65536 + (PENDHI - 55296) * 1024 + (U - 56320)
+        PENDHI = 0
+        SADD(UTF8(U), UTF8(U))                          :(RETURN)
+SUNIL   SETERR('unpaired surrogate escape')             :(FRETURN)
+SUNI_END
+*
+        DEFINE('SEND()')                                :(SEND_END)
+SEND    NE(PENDHI, 0)                                   :S(SENDL)
+        STRV = BJOIN(SRAW)
+        STRQ = BJOIN(SQ) Q1                             :(RETURN)
+SENDL   SETERR('unpaired surrogate escape')             :(FRETURN)
+SEND_END
+*
+* ---------------------------------------------------------------- tree building
+* Also called from inside the pattern match (as *F()); each returns the null
+* string, which matches the empty string, or fails to make the match fail.
+* VS is the value stack, KS the stack of member names.
+        DEFINE('PUSH(X)')                               :(PUSH_END)
+PUSH    VS = CELL(X, VS)                                :(RETURN)
+PUSH_END
+        DEFINE('POP()')                                 :(POP_END)
+POP     POP = HEAD(VS)
+        VS = NEXT(VS)                                   :(RETURN)
+POP_END
+*
+        DEFINE('ONSTR()')                               :(ONSTR_END)
+ONSTR   PUSH(NODE('S', STRV, SNUL, STRQ))               :(RETURN)
+ONSTR_END
+*
+        DEFINE('ONOTHER()')                             :(ONOTHER_END)
+ONOTHER SETERR('numbers, booleans and null are not allowed: ' RAW)
++                                                       :(FRETURN)
+ONOTHER_END
+*
+        DEFINE('ONKEY()')                               :(ONKEY_END)
+ONKEY   IDENT(STRV)                                     :S(ONKEYB)
+        IDENT(STRV,'.')                                 :S(ONKEYB)
+        IDENT(STRV,'..')                                :S(ONKEYB)
+        STRV BREAK('/' NUL)                             :S(ONKEYB)
+        KS = CELL(STRV, KS)                             :(RETURN)
+ONKEYB  SETERR('invalid name ' STRQ)                    :(FRETURN)
+ONKEY_END
+*
+        DEFINE('ONMEMBER()V,T')                         :(ONMEMBER_END)
+ONMEMBER V = POP()
+        T = NVAL(HEAD(VS))
+* A duplicate name keeps the last value.
+        T<HEAD(KS)> = V
+        KS = NEXT(KS)                                   :(RETURN)
+ONMEMBER_END
+*
+        DEFINE('BEGINOBJ()')                            :(BEGINOBJ_END)
+BEGINOBJ PUSH(NODE('O', TABLE(), 0))                    :(RETURN)
+BEGINOBJ_END
+*
+        DEFINE('BEGINARR()')                            :(BEGINARR_END)
+BEGINARR PUSH(NODE('A', TABLE(), 0))                    :(RETURN)
+BEGINARR_END
+*
+        DEFINE('ONELEM()V,A,T')                         :(ONELEM_END)
+ONELEM  V = POP()
+        A = HEAD(VS)
+        NCNT(A) = NCNT(A) + 1
+        T = NVAL(A)
+        T<NCNT(A)> = V                                  :(RETURN)
+ONELEM_END
+*
+* An array must be ["link", target] or ["script", content].
+        DEFINE('ENDARR()A,T,K,V')                       :(ENDARR_END)
+ENDARR  A = POP()
+        T = NVAL(A)
+        EQ(NCNT(A), 2)                                  :F(ENDARRB)
+        IDENT(NKIND(T<1>), 'S')                         :F(ENDARRB)
+        IDENT(NKIND(T<2>), 'S')                         :F(ENDARRB)
+        K = NVAL(T<1>)
+        V = T<2>
+        IDENT(K, 'script')                              :S(ENDARRS)
+        IDENT(K, 'link')                                :F(ENDARRK)
+* A symlink target cannot contain NUL (RFC section 10).
+        NE(NCNT(V), 0)                                  :S(ENDARRN)
+        PUSH(NODE('L', NVAL(V), 0, NQ(V)))              :(RETURN)
+ENDARRS PUSH(NODE('X', NVAL(V), 0, NQ(V)))              :(RETURN)
+ENDARRB SETERR('an array must be ["link", target] or ["script", content]')
++                                                       :(FRETURN)
+ENDARRK SETERR('unknown array kind')                    :(FRETURN)
+ENDARRN SETERR('a link target cannot contain NUL')      :(FRETURN)
+ENDARR_END
+*
+* ---------------------------------------------------------------- output
+* QUOTE(S): S as one single-quoted shell word.
+        DEFINE('QUOTE(S)P,PRE,B')                       :(QUOTE_END)
+QUOTE   B = BNEW()
+        BADD(B, Q1)
+        P = 0
+QUOTEL  S TAB(P) BREAK(Q1) . PRE Q1 @P                  :F(QUOTEE)
+        BADD(B, PRE Q1 BS Q1 Q1)                        :(QUOTEL)
+QUOTEE  S TAB(P) REM . PRE
+        BADD(B, PRE Q1)
+        QUOTE = BJOIN(B)                                :(RETURN)
+QUOTE_END
+*
+* EMIT(PATH,ND): the commands for the members of object ND at PATH, in
+* ascending UTF-8 byte order of the names (LGT compares bytes unsigned).
+* Content is passed as the words between NULs (NUL cannot travel in a shell
+* argument); the script joins them with NUL bytes using a constant format.
+        DEFINE('EMIT(PATH,ND)T,A,KEYS,N,I,J,KEY,CH,P2,KD')  :(EMIT_END)
+EMIT    T = NVAL(ND)
+        A = CONVERT(T, 'ARRAY')                         :F(RETURN)
+        N = 0
+EMITC   A<N + 1, 1>                                     :F(EMITC2)
+        N = N + 1                                       :(EMITC)
+EMITC2  KEYS = ARRAY(N)
+        I = 0
+EMITC3  I = LT(I, N) I + 1                              :F(EMITS)
+        KEYS<I> = A<I, 1>                               :(EMITC3)
+EMITS   I = 2
+EMITS1  GT(I, N)                                        :S(EMITW)
+        KEY = KEYS<I>
+        J = I - 1
+EMITS2  GT(J, 0) LGT(KEYS<J>, KEY)                      :F(EMITS3)
+        KEYS<J + 1> = KEYS<J>
+        J = J - 1                                       :(EMITS2)
+EMITS3  KEYS<J + 1> = KEY
+        I = I + 1                                       :(EMITS1)
+EMITW   I = 0
+EMITW1  I = LT(I, N) I + 1                              :F(RETURN)
+        KEY = KEYS<I>
+        CH = T<KEY>
+        P2 = PATH '/' KEY
+        KD = NKIND(CH)
+        IDENT(KD, 'O')                                  :S(EMITO)
+        IDENT(KD, 'S')                                  :S(EMITF)
+        IDENT(KD, 'X')                                  :S(EMITX)
+        OUT = '_j2d_link ' QUOTE(P2) ' ' NQ(CH) NL      :(EMITW1)
+EMITO   OUT = '_j2d_dir ' QUOTE(P2) NL
+        EMIT(P2, CH)                                    :(EMITW1)
+EMITF   OUT = '_j2d_file ' QUOTE(P2) ' ' NQ(CH) NL      :(EMITW1)
+EMITX   OUT = '_j2d_script ' QUOTE(P2) ' ' NQ(CH) NL    :(EMITW1)
+EMIT_END
+*
+* ---------------------------------------------------------------- grammar
+* RFC 8259 JSON as one recursive pattern; *VALUE is the recursion. Bytes
+* 128-255 are plain string bytes here (UTF-8 was checked while reading).
+        WS = SPAN(' ' CHAR(9) CHAR(10) CHAR(13)) | ''
+        HEXD = ANY('0123456789abcdefABCDEF')
+        HEX4 = HEXD HEXD HEXD HEXD
+        PLAIN = RANGE(32,33) RANGE(35,38) RANGE(40,91) RANGE(93,255)
+        PIECE = SPAN(PLAIN) $ X *SPLAIN()
++             | Q1 *SQUOTE()
++             | BS ANY('"/bfnrt' BS) $ E *SESC()
++             | BS 'u' HEX4 $ H *SUNI()
+        JSTR = '"' *SBEGIN() ARBNO(PIECE) '"' *SEND()
+        DIGITS = '0123456789'
+        NUMBER = ('-' | '')
++                ('0' | ANY('123456789') (SPAN(DIGITS) | ''))
++                ('.' SPAN(DIGITS) | '')
++                (ANY('eE') (ANY('+-') | '') SPAN(DIGITS) | '')
+        SCALAR = (NUMBER | 'true' | 'false' | 'null') $ RAW *ONOTHER()
+        MEMBER = WS JSTR *ONKEY() WS ':' *VALUE *ONMEMBER()
+        OBJECT = '{' *BEGINOBJ() WS
++                ('}' | MEMBER ARBNO(',' MEMBER) '}')
+        ARRAY_ = '[' *BEGINARR() WS
++                (']' | *VALUE *ONELEM() ARBNO(',' *VALUE *ONELEM()) ']')
++                *ENDARR()
+        VALUE = WS (OBJECT | ARRAY_ | JSTR *ONSTR() | SCALAR) WS
+*
+        VS =
+        KS =
+        DOC VALUE RPOS(0)                               :F(BADJSON)
+        ROOT = POP()
+        IDENT(NKIND(ROOT), 'O')                         :S(EMITALL)
+        SETERR('the root of the document must be an object') :(FAIL)
+BADJSON SETERR('invalid JSON')                          :(FAIL)
+*
+EMITALL OUT = 'set -eu' NL
++ "_j2d_fail() { printf 'json2dir: cannot create %s\n' " '"$1" >&2; exit 1; }' NL
++ '# Remove an existing non-directory (a symlink itself, never its target);' NL
++ '# a real directory in the way of a non-object is an error.' NL
++ '_j2d_clear() {' NL
++ '  if [ -L "$1" ]; then rm -f -- "$1" || _j2d_fail "$1"' NL
++ "  elif [ -d " '"$1" ]; then printf ' Q1 'json2dir: a directory is in the way: %s\n'
++ Q1 ' "$1" >&2; exit 1' NL
++ '  elif [ -e "$1" ]; then rm -f -- "$1" || _j2d_fail "$1"' NL
++ '  fi' NL
++ '}' NL
++ '_j2d_dir() {' NL
++ '  if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then rm -f -- "$1" || _j2d_fail "$1"; fi' NL
++ '  if [ ! -d "$1" ]; then mkdir -- "$1" || _j2d_fail "$1"; fi' NL
++ '}' NL
++ '# _j2d_file path part...: the content is the parts joined by NUL bytes.' NL
++ '_j2d_file() {' NL
++ '  _j2d_clear "$1"' NL
++ '  _j2d_path=$1; shift' NL
++ '  {' NL
++ "    printf '%s' " '"$1"; shift' NL
++ '    for _j2d_part in "$@"; do printf ' Q1 BS "000%s' " '"$_j2d_part"; done' NL
++ '  } > "$_j2d_path" || _j2d_fail "$_j2d_path"' NL
++ '}' NL
++ '_j2d_script() { _j2d_file "$@"; chmod a+x -- "$1" || _j2d_fail "$1"; }' NL
++ '_j2d_link() { _j2d_clear "$1"; ln -s -- "$2" "$1" || _j2d_fail "$1"; }' NL
+        EMIT('.', ROOT)
+        OUT = '# json2dir: end' NL                      :(END)
+*
+NOIN    SETERR("couldn't read the input")               :(FAIL)
+NOOUT   SETERR("couldn't open the output")              :(FAIL)
+FAIL    TERMINAL = 'json2dir: ' ERRMSG
+        &CODE = 1
+END
